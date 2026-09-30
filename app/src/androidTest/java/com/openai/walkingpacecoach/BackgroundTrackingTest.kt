@@ -94,6 +94,20 @@ class BackgroundTrackingTest {
             scenario.close()
         }
     }
+    @Test fun missingVelocityAccumulatesAnAccuratePositionBaseline() {
+        val processor = SpeedProcessor()
+        val first = Location("gps").apply {
+            latitude = 52.0; longitude = 4.0; accuracy = 1f
+            elapsedRealtimeNanos = 1_000_000_000L
+        }
+        assertFalse(processor.process(first).valid)
+        assertFalse(processor.process(Location(first).apply {
+            latitude += 0.000004; elapsedRealtimeNanos = 2_000_000_000L
+        }).valid)
+        assertTrue(processor.process(Location(first).apply {
+            latitude += 0.00002; elapsedRealtimeNanos = 4_000_000_000L
+        }).valid)
+    }
     @Test fun gpsQualityRejectsUncertainAndOutOfOrderFixes() {
         val processor = SpeedProcessor()
         val first = Location("gps").apply {

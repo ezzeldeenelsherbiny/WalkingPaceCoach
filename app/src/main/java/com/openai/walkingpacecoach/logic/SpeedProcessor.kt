@@ -39,7 +39,8 @@ class SpeedProcessor(
         if (previous != null && location.elapsedRealtimeNanos <= previous.elapsedRealtimeNanos) {
             return Result(false, reason = "Ignoring duplicate or out-of-order GPS reading")
         }
-        if (previous != null && location.elapsedRealtimeNanos - previous.elapsedRealtimeNanos > 6_000_000_000L) {
+        val maxGapNanos = if (location.hasSpeed()) 6_000_000_000L else 30_000_000_000L
+        if (previous != null && location.elapsedRealtimeNanos - previous.elapsedRealtimeNanos > maxGapNanos) {
             recentSpeeds.clear()
             previous = null
         }
@@ -53,8 +54,8 @@ class SpeedProcessor(
 
         val selectedMps = gpsSpeedMps?.takeIf { it.isFinite() } ?: derivedSpeedMps
         if (selectedMps == null) {
-            previousAccepted = Location(location)
-            return Result(false, reason = "Waiting for speed fix…")
+            if (previous == null) previousAccepted = Location(location)
+            return Result(false, reason = "Waiting for reliable speed fix…")
         }
 
         val rawKmh = selectedMps * 3.6

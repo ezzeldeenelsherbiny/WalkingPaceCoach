@@ -106,6 +106,16 @@ class MainActivity : ComponentActivity() {
     private fun startPendingWorkout() {
         val config = pendingStartConfig ?: return
         if (!hasPreciseLocation() || !NotificationManagerCompat.from(this).areNotificationsEnabled()) return
+        val notificationManager = getSystemService(android.app.NotificationManager::class.java)
+        val channels = listOfNotNull(notificationManager.getNotificationChannel(TrackingService.CHANNEL_ID),
+            notificationManager.getNotificationChannel(TrackingService.ALERT_CHANNEL_ID))
+        if (channels.any { it.importance == android.app.NotificationManager.IMPORTANCE_NONE }) {
+            AlertDialog.Builder(this).setTitle("Enable the notification channels")
+                .setMessage("Turn on Active walk and Slowdown reminders in notification settings before starting.")
+                .setPositiveButton("Settings") { _, _ -> enableNotifications() }
+                .setNegativeButton("Later") { _, _ -> pendingStartConfig = null }.show()
+            return
+        }
         val power = getSystemService(PowerManager::class.java)
         val setupPrefs = getSharedPreferences("phone_setup", MODE_PRIVATE)
         if (!power.isIgnoringBatteryOptimizations(packageName) && !setupPrefs.getBoolean("batteryExplained", false)) {
