@@ -164,6 +164,8 @@ class TrackingService : Service() {
                 delay(intent.getLongExtra("testDelayMs", 0L).coerceIn(0L, 10_000L))
                 showPaceAlert(test = true)
                 vibrator.warn(VibrationPattern.STRONG)
+                // Leave the lock-screen test visible long enough to inspect it.
+                delay(8_000L)
                 if (!isRunning) {
                     releaseTrackingWakeLock()
                     ServiceCompat.stopForeground(this@TrackingService, ServiceCompat.STOP_FOREGROUND_REMOVE)
