@@ -56,7 +56,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.max
 
-private enum class Screen { HOME, LIVE, HISTORY, DETAIL, SETTINGS }
+private enum class Screen { HOME, LIVE, HISTORY, DETAIL, SETTINGS, SETUP }
 
 @Composable
 fun WalkingPaceCoachUi(
@@ -64,7 +64,8 @@ fun WalkingPaceCoachUi(
     onStartWorkout: (TrackingConfig) -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
-    onFinish: () -> Unit
+    onFinish: () -> Unit,
+    setup: @Composable () -> Unit
 ) {
     val tracking by viewModel.tracking.collectAsState()
     val settings by viewModel.settings.collectAsState()
@@ -95,6 +96,7 @@ fun WalkingPaceCoachUi(
                         TextButton(onClick = { screen = Screen.HOME }) { Text("Home") }
                         TextButton(onClick = { screen = Screen.HISTORY }) { Text("History") }
                         TextButton(onClick = { screen = Screen.SETTINGS }) { Text("Settings") }
+                        TextButton(onClick = { screen = Screen.SETUP }) { Text("Phone setup") }
                     }
                 }
             }
@@ -120,6 +122,7 @@ fun WalkingPaceCoachUi(
                         )
                     } ?: Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Loading workout…") }
                     Screen.SETTINGS -> SettingsScreen(settings, viewModel::updateSettings)
+                    Screen.SETUP -> setup()
                 }
             }
         }
@@ -286,7 +289,7 @@ private fun SettingsScreen(settings: AppSettings, onChange: (AppSettings) -> Uni
             }
         }
         Spacer(Modifier.height(16.dp))
-        Text("Default behavior is vibration only. This app does not play audio.")
+        Text("Slowdown reminders use vibration and a visible notification. This app does not play audio. Check Phone setup to test alerts and background permissions.")
     }
 }
 
@@ -422,3 +425,4 @@ private fun formatDuration(ms: Long): String {
 
 private fun formatDate(epochMs: Long): String =
     SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(epochMs))
+

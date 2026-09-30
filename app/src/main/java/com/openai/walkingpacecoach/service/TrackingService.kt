@@ -16,12 +16,9 @@ import android.os.SystemClock
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
-import com.google.android.gms.location.FusedLocationProviderClient
-import com.google.android.gms.location.LocationCallback
-import com.google.android.gms.location.LocationRequest
-import com.google.android.gms.location.LocationResult
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
+import android.location.LocationManager
+import android.location.LocationListener
+import android.os.PowerManager
 import com.openai.walkingpacecoach.MainActivity
 import com.openai.walkingpacecoach.R
 import com.openai.walkingpacecoach.WalkingPaceCoachApp
@@ -62,7 +59,10 @@ class TrackingService : Service() {
         const val EXTRA_STATIONARY_SECONDS = "stationary_seconds"
         const val EXTRA_PATTERN = "pattern"
 
-        private const val CHANNEL_ID = "walking_tracking"
+        const val CHANNEL_ID = "walking_tracking_v2"
+        const val ALERT_CHANNEL_ID = "walking_pace_alerts_v2"
+        const val ALERT_NOTIFICATION_ID = 4402
+        const val ACTION_TEST_ALERT = "com.openai.walkingpacecoach.TEST_ALERT"
         private const val NOTIFICATION_ID = 4401
 
         private val _snapshot = MutableStateFlow(TrackingSnapshot())
@@ -74,8 +74,12 @@ class TrackingService : Service() {
         fun clearLastCompletedWorkoutId() { _lastCompletedWorkoutId.value = null }
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private lateinit var fusedClient: FusedLocationProviderClient
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private lateinit var locationManager: LocationManager
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wakeRenewedAtMs = 0L
+    private var lastGpsFixMs = 0L
+    private var finishing = false
     private lateinit var vibrator: VibrationController
     private val processor = SpeedProcessor()
     private val alertMachine = AlertStateMachine()
@@ -103,24 +107,40 @@ class TrackingService : Service() {
 
     private val prefs by lazy { getSharedPreferences("active_workout", Context.MODE_PRIVATE) }
 
-    private val locationCallback = object : LocationCallback() {
-        override fun onLocationResult(result: LocationResult) {
-            val location = result.lastLocation ?: return
+    private val locationCallback = object : LocationListener {
+        override fun onLocationChanged(location: android.location.Location) {
+            val now = SystemClock.elapsedRealtime()
+            if (location.provider == LocationManager.GPS_PROVIDER) lastGpsFixMs = now
+            // Prefer GNSS; network fixes are fallback only and still pass accuracy checks.
+            if (location.provider != LocationManager.GPS_PROVIDER && now - lastGpsFixMs < 6_000L) return
             handleLocation(location)
         }
+        override fun onProviderEnabled(provider: String) { requestLocationUpdates() }
+        override fun onProviderDisabled(provider: String) {
+            processor.reset()
+            publish(currentSnapshot().copy(gpsMessage = "GPS disabled — enable Location"))
+        }
+        @Deprecated("Legacy callback")
+        override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) = Unit
     }
 
     override fun onCreate() {
         super.onCreate()
-        fusedClient = LocationServices.getFusedLocationProviderClient(this)
+        locationManager = getSystemService(LocationManager::class.java)
         vibrator = VibrationController(this)
         createNotificationChannel()
         scope.launch {
             while (isActive) {
                 delay(2_000L)
+                if (isRunning && !manuallyPaused) {
+                    acquireTrackingWakeLock()
+                    publish(currentSnapshot())
+                }
                 val last = lastLocationReceivedElapsedMs
                 if (isRunning && !manuallyPaused && last != null && SystemClock.elapsedRealtime() - last > 6_000L) {
                     vibrator.cancel()
+                    clearPaceAlert()
+                    processor.reset()
                     alertMachine.update(SystemClock.elapsedRealtime(), null, config, manuallyPaused = false)
                     lastStatsElapsedMs = null
                     publish(currentSnapshot().copy(
@@ -137,6 +157,19 @@ class TrackingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_TEST_ALERT) {
+            startAsForeground()
+            scope.launch {
+                delay(intent.getLongExtra("testDelayMs", 0L).coerceIn(0L, 10_000L))
+                showPaceAlert(test = true)
+                vibrator.warn(VibrationPattern.STRONG)
+                if (!isRunning) {
+                    ServiceCompat.stopForeground(this@TrackingService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            }
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
             ACTION_START -> startTracking(configFromIntent(intent))
             ACTION_PAUSE -> pauseTracking()
@@ -145,7 +178,7 @@ class TrackingService : Service() {
             ACTION_STOP_ONLY -> finishTracking(save = false)
             else -> if (prefs.getBoolean("active", false) && !isRunning) restoreAfterProcessRecreation()
         }
-        return START_STICKY
+        return if (isRunning) START_STICKY else START_NOT_STICKY
     }
 
     private fun configFromIntent(intent: Intent) = TrackingConfig(
@@ -161,7 +194,7 @@ class TrackingService : Service() {
     )
 
     private fun startTracking(newConfig: TrackingConfig) {
-        if (isRunning) return
+        if (isRunning || finishing) return
         if (newConfig.targetSpeedKmh <= 0.0 || !newConfig.targetSpeedKmh.isFinite()) return
         if (!hasLocationPermission()) {
             stopSelf()
@@ -175,7 +208,16 @@ class TrackingService : Service() {
         isRunning = true
         persistActiveState()
 
-        startAsForeground()
+        try {
+            startAsForeground()
+            if (!manuallyPaused) acquireTrackingWakeLock()
+        } catch (_: RuntimeException) {
+            isRunning = false
+            prefs.edit().clear().apply()
+            publish(currentSnapshot().copy(gpsMessage = "Reopen the app and grant precise location to restart tracking"))
+            stopSelf()
+            return
+        }
         requestLocationUpdates()
         publish(
             TrackingSnapshot(
@@ -214,8 +256,18 @@ class TrackingService : Service() {
         longestTargetStreakMs = prefs.getLong("longestTarget", 0L)
         longestBelowStreakMs = prefs.getLong("longestBelow", 0L)
         manuallyPaused = prefs.getBoolean("paused", false)
+        if (manuallyPaused) pauseStartedElapsedMs = SystemClock.elapsedRealtime()
         isRunning = true
-        startAsForeground()
+        try {
+            startAsForeground()
+            if (!manuallyPaused) acquireTrackingWakeLock()
+        } catch (_: RuntimeException) {
+            isRunning = false
+            prefs.edit().clear().apply()
+            publish(currentSnapshot().copy(gpsMessage = "Reopen the app and grant precise location to restart tracking"))
+            stopSelf()
+            return
+        }
         requestLocationUpdates()
         publish(
             TrackingSnapshot(
@@ -224,7 +276,7 @@ class TrackingService : Service() {
                 alertState = if (manuallyPaused) AlertState.PAUSED else AlertState.WAITING_FOR_GPS,
                 gpsMessage = if (manuallyPaused) "Workout paused" else "Restored — waiting for accurate GPS…",
                 distanceMeters = distanceMeters,
-                elapsedMs = atTargetMs + belowTargetMs,
+                elapsedMs = restoredBaseElapsedMs,
                 targetSpeedKmh = config.targetSpeedKmh,
                 timeAtOrAboveTargetMs = atTargetMs,
                 timeBelowTargetMs = belowTargetMs,
@@ -262,6 +314,8 @@ class TrackingService : Service() {
         pauseStartedElapsedMs = SystemClock.elapsedRealtime()
         lastStatsElapsedMs = null
         vibrator.cancel()
+        clearPaceAlert()
+        releaseTrackingWakeLock()
         alertMachine.reset()
         persistActiveState()
         publish(currentSnapshot().copy(
@@ -280,6 +334,7 @@ class TrackingService : Service() {
         pauseStartedElapsedMs?.let { accumulatedPauseMs += now - it }
         pauseStartedElapsedMs = null
         manuallyPaused = false
+        acquireTrackingWakeLock()
         lastStatsElapsedMs = null
         processor.reset()
         alertMachine.reset()
@@ -297,6 +352,8 @@ class TrackingService : Service() {
     private fun handleLocation(location: android.location.Location) {
         if (!isRunning) return
         val now = SystemClock.elapsedRealtime()
+        val ageMs = (SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos) / 1_000_000L
+        if (ageMs < 0L || ageMs > 6_000L) return
         lastLocationReceivedElapsedMs = now
         if (manuallyPaused) {
             publish(currentSnapshot().copy(
@@ -311,6 +368,7 @@ class TrackingService : Service() {
         val result = processor.process(location)
         if (!result.valid || result.smoothedSpeedKmh == null) {
             vibrator.cancel()
+            clearPaceAlert()
             alertMachine.update(now, null, config, manuallyPaused = false)
             lastStatsElapsedMs = null
             publish(currentSnapshot().copy(
@@ -330,11 +388,15 @@ class TrackingService : Service() {
         maxSpeedKmh = max(maxSpeedKmh, smoothed)
 
         val decision = alertMachine.update(now, smoothed, config, manuallyPaused = false)
-        if (decision.shouldVibrate && config.vibrationEnabled) {
-            vibrator.warn(config.vibrationPattern)
+        if (decision.shouldVibrate) {
+            showPaceAlert()
+            if (config.vibrationEnabled) vibrator.warn(config.vibrationPattern)
             warningCount++
         }
-        if (decision.state != AlertState.BELOW_TARGET_ALERTING) vibrator.cancel()
+        if (decision.state != AlertState.BELOW_TARGET_ALERTING) {
+            vibrator.cancel()
+            clearPaceAlert()
+        }
 
         val previousTick = lastStatsElapsedMs
         if (previousTick != null) {
@@ -427,8 +489,11 @@ class TrackingService : Service() {
         }
         val finalSnapshot = currentSnapshot()
         isRunning = false
+        finishing = save
+        releaseTrackingWakeLock()
+        clearPaceAlert()
         vibrator.cancel()
-        fusedClient.removeLocationUpdates(locationCallback)
+        locationManager.removeUpdates(locationCallback)
         prefs.edit().clear().apply()
 
         if (save && finalSnapshot.elapsedMs > 0L) {
@@ -451,9 +516,13 @@ class TrackingService : Service() {
             publish(finalSnapshot.copy(isActive = false, isManuallyPaused = false, gpsMessage = "Workout complete"))
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             scope.launch {
-                val id = app.repository.saveWorkout(workout, samplesCopy)
-                _lastCompletedWorkoutId.value = id
-                stopSelf()
+                try {
+                    val id = app.repository.saveWorkout(workout, samplesCopy)
+                    _lastCompletedWorkoutId.value = id
+                } finally {
+                    finishing = false
+                    stopSelf()
+                }
             }
             return
         }
@@ -464,25 +533,61 @@ class TrackingService : Service() {
     }
 
     private fun requestLocationUpdates() {
-        if (!hasLocationPermission()) return
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1_000L)
-            .setMinUpdateIntervalMillis(700L)
-            .setMaxUpdateDelayMillis(2_000L)
-            .setWaitForAccurateLocation(false)
-            .build()
+        if (!isRunning || !hasLocationPermission()) return
         try {
-            fusedClient.requestLocationUpdates(request, locationCallback, mainLooper)
+            locationManager.removeUpdates(locationCallback)
+            val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                .filter { locationManager.allProviders.contains(it) && locationManager.isProviderEnabled(it) }
+            for (provider in providers) {
+                locationManager.requestLocationUpdates(provider, 1_000L, 0f, locationCallback, mainLooper)
+            }
+            if (providers.isEmpty()) publish(currentSnapshot().copy(gpsMessage = "Enable phone Location/GPS"))
         } catch (_: SecurityException) {
-            publish(currentSnapshot().copy(
-                alertState = AlertState.WAITING_FOR_GPS,
-                gpsMessage = "Location permission unavailable"
-            ))
+            publish(currentSnapshot().copy(gpsMessage = "Precise location permission is needed"))
+            finishTracking(save = true)
         }
     }
 
+    private fun acquireTrackingWakeLock() {
+        val now = SystemClock.elapsedRealtime()
+        if (wakeLock?.isHeld == true && now - wakeRenewedAtMs < 5 * 60 * 1000L) return
+        val lock = wakeLock ?: getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WalkingPaceCoach:ActiveWalk")
+            .also { it.setReferenceCounted(false); wakeLock = it }
+        // Bounded lease, renewed only while a user-started workout is active.
+        lock.acquire(10 * 60 * 1000L)
+        wakeRenewedAtMs = now
+    }
+
+    private fun releaseTrackingWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+    }
+
+    private fun clearPaceAlert() {
+        getSystemService(NotificationManager::class.java).cancel(ALERT_NOTIFICATION_ID)
+    }
+
+    private fun showPaceAlert(test: Boolean = false) {
+        if (!androidx.core.app.NotificationManagerCompat.from(this).areNotificationsEnabled()) return
+        val open = PendingIntent.getActivity(this, 10, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val speed = _snapshot.value.smoothedSpeedKmh?.let { "%.1f".format(it) } ?: "—"
+        val text = if (test) "Test alert: check vibration and lock-screen notifications" else
+            "Keep the pace: $speed km/h; target ${"%.1f".format(config.targetSpeedKmh)} km/h"
+        val notification = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(if (test) "Walking Pace Coach — test" else "Increase your walking speed")
+            .setContentText(text).setContentIntent(open)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(false).setAutoCancel(true).setTimeoutAfter(30_000L)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(ALERT_NOTIFICATION_ID, notification)
+    }
+
     private fun hasLocationPermission(): Boolean =
-        ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
-            ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
     private fun startAsForeground() {
         val notification = buildNotification()
@@ -499,16 +604,21 @@ class TrackingService : Service() {
     }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "Active walking workout",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Shows while GPS pace tracking is active"
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(NotificationChannel(CHANNEL_ID,
+            "Active walk / background GPS", NotificationManager.IMPORTANCE_LOW).apply {
+            description = "Persistent tracking controls while a walk is active"
             setSound(null, null)
             enableVibration(false)
-        }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        })
+        manager.createNotificationChannel(NotificationChannel(ALERT_CHANNEL_ID,
+            "Slowdown reminders", NotificationManager.IMPORTANCE_HIGH).apply {
+            description = "Visible pace reminders; vibration is controlled by the app setting"
+            setSound(null, null)
+            enableVibration(false)
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        })
     }
 
     private fun buildNotification(): Notification {
@@ -539,6 +649,8 @@ class TrackingService : Service() {
             .setContentText("$speedText • target ${String.format("%.1f", config.targetSpeedKmh)} km/h")
             .setContentIntent(contentIntent)
             .setOngoing(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(0, pauseLabel, pausePending)
@@ -579,9 +691,17 @@ class TrackingService : Service() {
         _snapshot.value = snapshot
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Closing the activity is not finishing the user-started workout.
+        if (isRunning) persistActiveState()
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
+        releaseTrackingWakeLock()
+        clearPaceAlert()
         if (isRunning) {
-            runCatching { fusedClient.removeLocationUpdates(locationCallback) }
+            runCatching { locationManager.removeUpdates(locationCallback) }
             vibrator.cancel()
         }
         scope.cancel()
@@ -590,3 +710,4 @@ class TrackingService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 }
+

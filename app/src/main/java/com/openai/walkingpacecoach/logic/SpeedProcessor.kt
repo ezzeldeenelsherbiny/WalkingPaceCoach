@@ -2,6 +2,7 @@ package com.openai.walkingpacecoach.logic
 
 import android.location.Location
 import kotlin.math.max
+import kotlin.math.min
 
 class SpeedProcessor(
     private val maxAccuracyMeters: Float = 35f,
@@ -29,11 +30,25 @@ class SpeedProcessor(
             return Result(false, reason = "Waiting for accurate GPS…")
         }
 
-        val previous = previousAccepted
+        if (location.hasSpeedAccuracy() && (!location.speedAccuracyMetersPerSecond.isFinite() ||
+                location.speedAccuracyMetersPerSecond > 0.75f)) {
+            recentSpeeds.clear()
+            return Result(false, reason = "Speed estimate uncertain — waiting for better GPS")
+        }
+        var previous = previousAccepted
+        if (previous != null && location.elapsedRealtimeNanos <= previous.elapsedRealtimeNanos) {
+            return Result(false, reason = "Ignoring duplicate or out-of-order GPS reading")
+        }
+        if (previous != null && location.elapsedRealtimeNanos - previous.elapsedRealtimeNanos > 6_000_000_000L) {
+            recentSpeeds.clear()
+            previous = null
+        }
         val dtSeconds = previous?.let { (location.elapsedRealtimeNanos - it.elapsedRealtimeNanos) / 1_000_000_000.0 } ?: 0.0
         val gpsSpeedMps = if (location.hasSpeed() && location.speed >= 0f) location.speed.toDouble() else null
         val derivedSpeedMps = if (previous != null && dtSeconds > 0.5) {
-            previous.distanceTo(location).toDouble() / dtSeconds
+            val distance = previous.distanceTo(location).toDouble()
+            val uncertainty = max(previous.accuracy, location.accuracy).toDouble()
+            if (dtSeconds >= 2.0 && distance > uncertainty) distance / dtSeconds else null
         } else null
 
         val selectedMps = gpsSpeedMps?.takeIf { it.isFinite() } ?: derivedSpeedMps
@@ -54,7 +69,10 @@ class SpeedProcessor(
             val accuracyAllowance = max(previous.accuracy, location.accuracy) * 2.0
             val maxPlausibleDistance = (maxWalkingRunningSpeedKmh / 3.6) * dtSeconds + accuracyAllowance
             if (distance <= maxPlausibleDistance && impliedKmh <= maxWalkingRunningSpeedKmh + 5.0) {
-                distanceIncrement = distance
+                // GNSS velocity avoids accumulating stationary positional jitter.
+                distanceIncrement = if (gpsSpeedMps != null) {
+                    min(distance + accuracyAllowance, gpsSpeedMps * dtSeconds)
+                } else distance
             }
         }
 
@@ -76,3 +94,4 @@ class SpeedProcessor(
         )
     }
 }
+
