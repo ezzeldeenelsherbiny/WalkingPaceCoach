@@ -159,11 +159,13 @@ class TrackingService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_TEST_ALERT) {
             startAsForeground()
+            acquireTrackingWakeLock()
             scope.launch {
                 delay(intent.getLongExtra("testDelayMs", 0L).coerceIn(0L, 10_000L))
                 showPaceAlert(test = true)
                 vibrator.warn(VibrationPattern.STRONG)
                 if (!isRunning) {
+                    releaseTrackingWakeLock()
                     ServiceCompat.stopForeground(this@TrackingService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }

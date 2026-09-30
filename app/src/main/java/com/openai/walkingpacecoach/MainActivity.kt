@@ -28,6 +28,10 @@ class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
     private var pendingStartConfig: TrackingConfig? = null
     private val refresh = mutableIntStateOf(0)
+    private val settingsLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        refresh.intValue++
+        if (pendingStartConfig != null && hasPreciseLocation() && NotificationManagerCompat.from(this).areNotificationsEnabled()) startPendingWorkout()
+    }
     private val locationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
@@ -102,6 +106,16 @@ class MainActivity : ComponentActivity() {
     private fun startPendingWorkout() {
         val config = pendingStartConfig ?: return
         if (!hasPreciseLocation() || !NotificationManagerCompat.from(this).areNotificationsEnabled()) return
+        val power = getSystemService(PowerManager::class.java)
+        val setupPrefs = getSharedPreferences("phone_setup", MODE_PRIVATE)
+        if (!power.isIgnoringBatteryOptimizations(packageName) && !setupPrefs.getBoolean("batteryExplained", false)) {
+            setupPrefs.edit().putBoolean("batteryExplained", true).apply()
+            AlertDialog.Builder(this).setTitle("Keep tracking with the screen off")
+                .setMessage("Allow background battery use for timely GPS and pace reminders while your phone is locked. This uses more battery during a walk.")
+                .setPositiveButton("Allow") { _, _ -> openSettings(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) }
+                .setNegativeButton("Start anyway") { _, _ -> startPendingWorkout() }.show()
+            return
+        }
         pendingStartConfig = null
         val intent = Intent(this, TrackingService::class.java).apply {
             action = TrackingService.ACTION_START
@@ -156,7 +170,7 @@ class MainActivity : ComponentActivity() {
     private fun openAppSettings() = openSettings(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
         Uri.parse("package:$packageName")))
     private fun openSettings(intent: Intent) {
-        try { startActivity(intent) } catch (_: RuntimeException) {
+        try { settingsLauncher.launch(intent) } catch (_: RuntimeException) {
             android.widget.Toast.makeText(this, "Open this app's permissions and battery settings in your phone Settings", android.widget.Toast.LENGTH_LONG).show()
         }
     }

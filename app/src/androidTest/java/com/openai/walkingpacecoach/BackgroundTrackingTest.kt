@@ -58,6 +58,8 @@ class BackgroundTrackingTest {
             shell("input keyevent KEYCODE_SLEEP")
             SystemClock.sleep(1000)
             assertFalse("Screen must be off for this test", power.isInteractive)
+            shell("dumpsys deviceidle force-idle")
+            assertTrue("Forced Doze should be active", power.isDeviceIdleMode)
             repeat(9) { index ->
                 manager.setTestProviderLocation(LocationManager.GPS_PROVIDER,
                     Location(LocationManager.GPS_PROVIDER).apply {
@@ -84,6 +86,7 @@ class BackgroundTrackingTest {
             assertFalse(TrackingService.snapshot.value.isActive)
             assertFalse(notifications.activeNotifications.any { it.id == 4401 || it.id == TrackingService.ALERT_NOTIFICATION_ID })
         } finally {
+            shell("dumpsys deviceidle unforce")
             context.startService(Intent(context, TrackingService::class.java).setAction(TrackingService.ACTION_STOP_ONLY))
             runCatching { manager.removeTestProvider(LocationManager.GPS_PROVIDER) }
             shell("input keyevent KEYCODE_WAKEUP")
