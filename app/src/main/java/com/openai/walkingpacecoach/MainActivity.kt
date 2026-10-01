@@ -18,7 +18,6 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.openai.walkingpacecoach.logic.TrackingConfig
-import com.openai.walkingpacecoach.logic.VibrationController
 import com.openai.walkingpacecoach.service.TrackingService
 import com.openai.walkingpacecoach.ui.MainViewModel
 import com.openai.walkingpacecoach.ui.SetupScreen
@@ -30,7 +29,9 @@ class MainActivity : ComponentActivity() {
     private val refresh = mutableIntStateOf(0)
     private val settingsLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         refresh.intValue++
-        if (pendingStartConfig != null && hasPreciseLocation() && NotificationManagerCompat.from(this).areNotificationsEnabled()) startPendingWorkout()
+        if (pendingStartConfig != null && gpsEnabled()) {
+            if (!hasPreciseLocation()) requestPreciseLocation() else requestNotificationThenStart()
+        }
     }
     private val locationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -86,10 +87,10 @@ class MainActivity : ComponentActivity() {
     }
     private fun beginStartFlow(config: TrackingConfig) {
         if (config.targetSpeedKmh <= 0.0 || !config.targetSpeedKmh.isFinite()) return
-        if (!getSystemService(LocationManager::class.java).isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+        pendingStartConfig = config
+        if (!gpsEnabled()) {
             openSettings(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)); return
         }
-        pendingStartConfig = config
         if (!hasPreciseLocation()) requestPreciseLocation() else requestNotificationThenStart()
     }
     private fun enableNotifications() {
@@ -103,13 +104,23 @@ class MainActivity : ComponentActivity() {
         if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) enableNotifications()
         else startPendingWorkout()
     }
+    private fun gpsEnabled() = getSystemService(LocationManager::class.java)
+        .isProviderEnabled(LocationManager.GPS_PROVIDER)
+
+    private fun channelsEnabled(): Boolean {
+        val manager = getSystemService(android.app.NotificationManager::class.java)
+        return listOfNotNull(manager.getNotificationChannel(TrackingService.CHANNEL_ID),
+            manager.getNotificationChannel(TrackingService.ALERT_CHANNEL_ID))
+            .all { it.importance != android.app.NotificationManager.IMPORTANCE_NONE }
+    }
+
     private fun startPendingWorkout() {
         val config = pendingStartConfig ?: return
+        if (!gpsEnabled()) {
+            openSettings(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)); return
+        }
         if (!hasPreciseLocation() || !NotificationManagerCompat.from(this).areNotificationsEnabled()) return
-        val notificationManager = getSystemService(android.app.NotificationManager::class.java)
-        val channels = listOfNotNull(notificationManager.getNotificationChannel(TrackingService.CHANNEL_ID),
-            notificationManager.getNotificationChannel(TrackingService.ALERT_CHANNEL_ID))
-        if (channels.any { it.importance == android.app.NotificationManager.IMPORTANCE_NONE }) {
+        if (!channelsEnabled()) {
             AlertDialog.Builder(this).setTitle("Enable the notification channels")
                 .setMessage("Turn on Active walk and Slowdown reminders in notification settings before starting.")
                 .setPositiveButton("Settings") { _, _ -> enableNotifications() }
@@ -165,9 +176,20 @@ class MainActivity : ComponentActivity() {
     private fun testAlert() {
         if (!hasPreciseLocation()) { requestPreciseLocation(); return }
         if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) { enableNotifications(); return }
+        if (!channelsEnabled()) {
+            AlertDialog.Builder(this).setTitle("Enable slowdown notifications")
+                .setMessage("Turn on Active walk and Slowdown reminders before testing the lock-screen alert.")
+                .setPositiveButton("Settings") { _, _ -> enableNotifications() }
+                .setNegativeButton("Later", null).show()
+            return
+        }
         val intent = Intent(this, TrackingService::class.java).setAction(TrackingService.ACTION_TEST_ALERT)
             .putExtra("testDelayMs", 5_000L)
-        ContextCompat.startForegroundService(this, intent)
+        try { ContextCompat.startForegroundService(this, intent) }
+        catch (_: RuntimeException) {
+            explain("Cannot run the alert test", "Check precise location and battery settings, then try again with the app open.")
+            return
+        }
         AlertDialog.Builder(this).setTitle("Test in 5 seconds")
             .setMessage("Lock your screen now. Expect a slowdown test notification and a strong double vibration. If vibration is missing, check Do Not Disturb and system vibration settings.")
             .setPositiveButton("OK", null).show()

@@ -84,6 +84,19 @@ class BackgroundTrackingTest {
             assertTrue("Tracking notification visible", notifications.activeNotifications.any { it.id == 4401 })
             assertTrue("Slowdown notification visible", notifications.activeNotifications.any { it.id == TrackingService.ALERT_NOTIFICATION_ID })
             assertFalse("The test must keep the screen off", power.isInteractive)
+            // Losing GPS must clear stale speed and pace alerts while keeping the walk active.
+            SystemClock.sleep(8_000)
+            assertTrue(TrackingService.snapshot.value.isActive)
+            assertNull(TrackingService.snapshot.value.smoothedSpeedKmh)
+            assertFalse(notifications.activeNotifications.any { it.id == TrackingService.ALERT_NOTIFICATION_ID })
+            manager.setTestProviderLocation(LocationManager.GPS_PROVIDER,
+                Location(LocationManager.GPS_PROVIDER).apply {
+                    latitude = 52.00003; longitude = 4.0; accuracy = 4f; speed = 0.4f
+                    speedAccuracyMetersPerSecond = 0.1f
+                    time = System.currentTimeMillis(); elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
+                })
+            SystemClock.sleep(1_000)
+            assertNotNull("Tracking recovers after GPS returns", TrackingService.snapshot.value.smoothedSpeedKmh)
             context.startService(Intent(context, TrackingService::class.java).setAction(TrackingService.ACTION_STOP_ONLY))
             SystemClock.sleep(1000)
             assertFalse(TrackingService.snapshot.value.isActive)
@@ -98,6 +111,37 @@ class BackgroundTrackingTest {
             scenario.close()
         }
     }
+    @Test fun standaloneAlertRemainsVisibleOnLockScreenAndCleansUp() {
+        permissions()
+        shell("input keyevent KEYCODE_WAKEUP")
+        shell("wm dismiss-keyguard")
+        val notifications = context.getSystemService(NotificationManager::class.java)
+        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        try {
+            scenario.onActivity { activity ->
+                ContextCompat.startForegroundService(activity, Intent(activity, TrackingService::class.java)
+                    .setAction(TrackingService.ACTION_TEST_ALERT).putExtra("testDelayMs", 2_000L))
+            }
+            shell("input keyevent KEYCODE_HOME")
+            shell("input keyevent KEYCODE_SLEEP")
+            SystemClock.sleep(4_000)
+            assertFalse(context.getSystemService(PowerManager::class.java).isInteractive)
+            assertTrue("Test notification stays visible", notifications.activeNotifications.any {
+                it.id == TrackingService.ALERT_NOTIFICATION_ID
+            })
+            assertFalse("Test does not start a walk", TrackingService.snapshot.value.isActive)
+            SystemClock.sleep(8_000)
+            assertFalse("Test service cleans up both notifications", notifications.activeNotifications.any {
+                it.id == 4401 || it.id == TrackingService.ALERT_NOTIFICATION_ID
+            })
+        } finally {
+            shell("am stopservice -n ${context.packageName}/.service.TrackingService")
+            shell("input keyevent KEYCODE_WAKEUP")
+            shell("wm dismiss-keyguard")
+            scenario.close()
+        }
+    }
+
     @Test fun missingVelocityAccumulatesAnAccuratePositionBaseline() {
         val processor = SpeedProcessor()
         val first = Location("gps").apply {
@@ -130,4 +174,3 @@ class BackgroundTrackingTest {
         assertFalse(processor.process(inaccurate).valid)
     }
 }
-
